@@ -1,0 +1,117 @@
+# Act3D GRPO stage (paper Sec. 3.3 / 4.1). Values are those of the released run (4x A100-80GB,
+# FSDP with CPU offload); scripts/train_rl.sh fills in paths.
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+data:
+  train_batch_size: 64
+  max_prompt_length: 16384
+  max_response_length: 8096
+  return_raw_chat: True
+  filter_overlong_prompts: False
+  seed: 20260906
+  dataloader_num_workers: 2
+  custom_cls:
+    path: ${oc.env:ACT3D_PKG}/dataset.py
+    name: Act3DDataset
+
+algorithm:
+  adv_estimator: grpo
+  kl_ctrl:
+    kl_coef: 0.0
+
+actor_rollout_ref:
+  hybrid_engine: True
+  model:
+    custom_chat_template: null           # the model's own (Qwen3.5) template
+    use_remove_padding: True
+    use_fused_kernels: True
+    enable_gradient_checkpointing: True
+    override_config:
+      attn_implementation: sdpa
+  actor:
+    optim:
+      lr: 2e-6
+    ppo_mini_batch_size: 16
+    ppo_micro_batch_size_per_gpu: 1
+    use_dynamic_bsz: False
+    use_kl_loss: True
+    kl_loss_coef: 0.005
+    entropy_coeff: 0.0
+    ulysses_sequence_parallel_size: 1
+    checkpoint:
+      save_contents: [model, extra]
+    fsdp_config:
+      param_offload: True
+      optimizer_offload: True
+      offload_policy: True
+  ref:
+    log_prob_micro_batch_size_per_gpu: 1
+    ulysses_sequence_parallel_size: 1
+  rollout:
+    name: vllm
+    mode: async
+    n: 8
+    temperature: 0.7
+    tensor_model_parallel_size: 2
+    gpu_memory_utilization: 0.30
+    max_model_len: 24576
+    max_num_seqs: 64
+    max_num_batched_tokens: 32768
+    enforce_eager: True
+    free_cache_engine: True
+    enable_chunked_prefill: False
+    calculate_log_probs: True
+    log_prob_micro_batch_size_per_gpu: 1
+    limit_images: 16
+    engine_kwargs:
+      vllm:
+        enable_prefix_caching: False
+    checkpoint_engine:
+      update_weights_bucket_megabytes: 4608
+    agent:
+      num_workers: 4
+    multi_turn:
+      enable: True
+      max_assistant_turns: 12              # up to 11 actions + the answer
+      max_user_turns: 12
+      max_parallel_calls: 1
+      tool_config_path: ${oc.env:ACT3D_DIR}/configs/render_tool.yaml
+
+reward_model:
+  use_reward_loop: True
+  num_workers: 4
+  timeout: 900                         # per rollout; covers two judge calls with retries
+  reward_manager:
+    source: register
+    name: rate_limited
+  max_concurrent: 4
+  max_rpm: 240
+  max_tpm: 100000
+  estimated_tokens_per_request: 1000
+
+custom_reward_function:
+  path: ${oc.env:ACT3D_PKG}/reward.py
+  name: compute_score
+
+trainer:
+  project_name: act3d
+  logger: [console]
+  critic_warmup: 0
+  val_before_train: False
+  nnodes: 1
+  n_gpus_per_node: 4
+  total_epochs: 1
+  save_freq: 5
+  test_freq: 5
+  max_actor_ckpt_to_keep: 1
+  log_val_generations: 4
+
+ray_kwargs:
+  ray_init:
+    include_dashboard: False
