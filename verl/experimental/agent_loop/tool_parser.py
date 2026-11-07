@@ -94,7 +94,16 @@ class HermesToolParser(ToolParser):
         function_calls = []
         for match in matches:
             try:
-                function_call = json.loads(match)
+                # Tolerant decode: small models sometimes emit several JSON objects in one
+                # <tool_call> (esp. when the prompt shows multiple reference poses), which makes
+                # json.loads raise "Extra data". raw_decode parses the FIRST object and ignores
+                # the trailing junk, so the call still executes instead of failing the whole turn.
+                _m = match.strip()
+                try:
+                    function_call = json.loads(_m)
+                except json.JSONDecodeError:
+                    _s = _m[_m.index("{"):]
+                    function_call, _ = json.JSONDecoder().raw_decode(_s)
                 name, arguments = function_call["name"], function_call["arguments"]
                 function_calls.append(FunctionCall(name=name, arguments=json.dumps(arguments, ensure_ascii=False)))
             except Exception as e:

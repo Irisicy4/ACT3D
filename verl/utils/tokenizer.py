@@ -94,6 +94,12 @@ def hf_processor(name_or_path, **kwargs):
                 from transformers.models.qwen3_vl import Qwen3VLModel
 
                 processor.get_rope_index = types.MethodType(Qwen3VLModel.get_rope_index, processor)
+                # transformers>=5: get_rope_index calls the sibling get_vision_position_ids
+                # on self; graft it too (it does not touch self, so binding is safe).
+                if hasattr(Qwen3VLModel, "get_vision_position_ids"):
+                    processor.get_vision_position_ids = types.MethodType(
+                        Qwen3VLModel.get_vision_position_ids, processor
+                    )
             case "Glm4vImageProcessor":
                 from transformers.models.glm4v import Glm4vModel
 

@@ -1,0 +1,22 @@
+# The tool schema is used for parsing only: the system prompt already describes the tool, so
+# scripts/train_rl.sh sets VERL_NO_TOOL_SCHEMA=1 and no `# Tools` block is rendered.
+tools:
+  - class_name: "act3d.tool.RenderViewTool"
+    config:
+      type: native
+    tool_schema:
+      type: "function"
+      function:
+        name: "render_view_tool"
+        description: "Move the camera with one relative action (optionally with a distance) and render the new view."
+        parameters:
+          type: "object"
+          properties:
+            action:
+              type: "string"
+              enum: ["forward", "backward", "left", "right", "up", "down",
+                     "turn_left", "turn_right", "turn_up", "turn_down"]
+            distance:
+              type: "number"
+              description: "Optional step: metres for moves, degrees for turns."
+          required: ["action"]

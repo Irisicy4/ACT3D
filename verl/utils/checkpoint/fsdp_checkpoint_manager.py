@@ -25,6 +25,17 @@ from accelerate import init_empty_weights
 from omegaconf import DictConfig
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import ShardedOptimStateDictConfig, ShardedStateDictConfig, StateDictType
+# transformers-5 compat: 4.x names below were removed in 5.x. The 5.x lazy module
+# self-swaps in sys.modules on every MISSED attribute lookup, so never probe missing names
+# (hasattr included) - gate on the version and set unconditionally via sys.modules.
+import sys as _sc
+import transformers as _tf_compat
+if int(_tf_compat.__version__.split(".")[0]) >= 5:
+    _v = _sc.modules["transformers"].AutoModelForImageTextToText     # settles lazy load
+    _m = _sc.modules["transformers"]
+    _m.AutoModelForVision2Seq = _v
+    _m.MistralForSequenceClassification = _m.AutoModelForSequenceClassification
+del _tf_compat, _sc
 from transformers import GenerationConfig, PreTrainedTokenizer, ProcessorMixin
 from transformers.dynamic_module_utils import custom_object_save
 

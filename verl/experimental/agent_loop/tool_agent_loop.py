@@ -88,6 +88,14 @@ class AgentData:
         # Temporary state for tool calls
         self.tool_calls: list[FunctionCall] = []
 
+        # Per-rollout tool instances (tool name -> instance_id): created lazily on the FIRST
+        # call to each tool and reused for every later call in this rollout, so stateful tools
+        # (e.g. render_view_tool's move-mode camera pose / render_count) keep their state
+        # across turns. Released together in run() when the rollout finishes. Calls to the same tool
+        # are serialized by a per-tool lock so concurrent calls cannot create two instances.
+        self.tool_instances: dict[str, str] = {}
+        self.tool_locks: dict[str, asyncio.Lock] = {}
+
         # Extra fields for dynamic addition, e.g., tool session data
         self.extra_fields: dict[str, Any] = {}
 
@@ -172,18 +180,27 @@ class ToolAgentLoop(AgentLoopBase):
 
         # State machine loop
         state = AgentState.PENDING
-        while state != AgentState.TERMINATED:
-            if state == AgentState.PENDING:
-                state = await self._handle_pending_state(agent_data, sampling_params)
-            elif state == AgentState.GENERATING:
-                state = await self._handle_generating_state(agent_data, sampling_params)
-            elif state == AgentState.PROCESSING_TOOLS:
-                state = await self._handle_processing_tools_state(agent_data)
-            elif state == AgentState.INTERACTING:
-                state = await self._handle_interacting_state(agent_data)
-            else:
-                logger.error(f"Invalid state: {state}")
-                state = AgentState.TERMINATED
+        try:
+            while state != AgentState.TERMINATED:
+                if state == AgentState.PENDING:
+                    state = await self._handle_pending_state(agent_data, sampling_params)
+                elif state == AgentState.GENERATING:
+                    state = await self._handle_generating_state(agent_data, sampling_params)
+                elif state == AgentState.PROCESSING_TOOLS:
+                    state = await self._handle_processing_tools_state(agent_data)
+                elif state == AgentState.INTERACTING:
+                    state = await self._handle_interacting_state(agent_data)
+                else:
+                    logger.error(f"Invalid state: {state}")
+                    state = AgentState.TERMINATED
+        finally:
+            # Release the per-rollout tool instances (created lazily in _call_tool, one per tool),
+            # also when generation or a tool step raised.
+            for _tool_name, _instance_id in agent_data.tool_instances.items():
+                try:
+                    await self.tools[_tool_name].release(_instance_id)
+                except Exception as e:
+                    logger.warning(f"Error releasing tool instance for {_tool_name}: {e}")
 
         # Finalize output
         response_ids = agent_data.prompt_ids[-len(agent_data.response_mask) :]
@@ -210,9 +227,12 @@ class ToolAgentLoop(AgentLoopBase):
 
     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
         """Handle the pending state: prepare the prompt and start generation."""
+        # VERL_NO_TOOL_SCHEMA=1: do not render the `# Tools` block into the system turn, for
+        # prompts that already describe the tool (and SFT data that had no such block).
+        _no_schema = os.environ.get("VERL_NO_TOOL_SCHEMA", "").lower() in ("1", "true", "yes")
         prompt_ids = await self.apply_chat_template(
             agent_data.messages,
-            tools=self.tool_schemas,
+            tools=None if _no_schema else self.tool_schemas,
             images=agent_data.image_data,
             videos=agent_data.video_data,
         )
@@ -276,6 +296,33 @@ class ToolAgentLoop(AgentLoopBase):
             return AgentState.INTERACTING
         else:
             return AgentState.TERMINATED
+
+    async def _prepend_turn_separator(self, agent_data: AgentData, response_ids: list[int]) -> list[int]:
+        """Restore the separator the chat template puts after an end-of-turn token.
+
+        Generation stops at the end-of-turn token (Qwen: `<|im_end|>`), but the template follows it with
+        a separator (`\\n`) before the next `<|im_start|>`. A continuation rendered on its own starts at
+        `<|im_start|>`, so without this the rollout reads `<|im_end|><|im_start|>user` while SFT and any
+        full-conversation render read `<|im_end|>\\n<|im_start|>user`.
+        """
+        if not hasattr(self, "_turn_end_and_separator"):
+            ids = await self.loop.run_in_executor(
+                None,
+                lambda: self.tokenizer.apply_chat_template(
+                    [{"role": "user", "content": ""}],
+                    add_generation_prompt=False,
+                    tokenize=True,
+                    return_dict=False,
+                    **self.apply_chat_template_kwargs,
+                ),
+            )
+            special = set(self.tokenizer.all_special_ids)
+            last = max((i for i, t in enumerate(ids) if t in special), default=None)
+            self._turn_end_and_separator = (None, []) if last is None else (ids[last], list(ids[last + 1 :]))
+        end_id, separator = self._turn_end_and_separator
+        if separator and agent_data.prompt_ids and agent_data.prompt_ids[-1] == end_id:
+            return separator + list(response_ids)
+        return response_ids
 
     async def _handle_processing_tools_state(self, agent_data: AgentData) -> AgentState:
         """Handle the processing tools state: execute tool calls and prepare tool responses."""
@@ -356,6 +403,7 @@ class ToolAgentLoop(AgentLoopBase):
                 videos=None,
                 remove_system_prompt=True,
             )
+            response_ids = await self._prepend_turn_separator(agent_data, response_ids)
 
         if len(agent_data.response_mask) + len(response_ids) >= self.response_length:
             return AgentState.TERMINATED
@@ -399,6 +447,7 @@ class ToolAgentLoop(AgentLoopBase):
             add_messages,
             remove_system_prompt=True,
         )
+        response_ids = await self._prepend_turn_separator(agent_data, response_ids)
 
         # Update prompt_ids and response_mask
         agent_data.prompt_ids += response_ids
@@ -424,10 +473,21 @@ class ToolAgentLoop(AgentLoopBase):
             tool_args = json.loads(tool_call.arguments)
             tool = self.tools[tool_name]
             kwargs = tools_kwargs.get(tool_name, {})
-            instance_id, _ = await tool.create(create_kwargs=kwargs.get("create_kwargs", {}))
-            tool_execution_response, tool_reward, res = await tool.execute(
-                instance_id, tool_args, agent_data=agent_data
-            )
+            # ONE tool instance per rollout (keyed by tool name), reused across turns: stateful
+            # tools (render_view_tool's move-mode camera pose, its render_count for the
+            # last-turn hint) must carry state from call to call. The previous create()+
+            # release() per call silently RESET that state every turn — in move mode each
+            # action stepped from the start pose again, so chained moves never actually
+            # progressed. Instances are released together when the rollout ends (see run()).
+            # Calls to the same tool run one at a time (the instance holds the state they share).
+            async with agent_data.tool_locks.setdefault(tool_name, asyncio.Lock()):
+                instance_id = agent_data.tool_instances.get(tool_name)
+                if instance_id is None:
+                    instance_id, _ = await tool.create(create_kwargs=kwargs.get("create_kwargs", {}))
+                    agent_data.tool_instances[tool_name] = instance_id
+                tool_execution_response, tool_reward, res = await tool.execute(
+                    instance_id, tool_args, agent_data=agent_data
+                )
         except Exception as e:
             logger.warning(f"Error when executing tool: {e}")
             return (
@@ -437,9 +497,6 @@ class ToolAgentLoop(AgentLoopBase):
                 0.0,
                 {},
             )
-        finally:
-            if tool and instance_id:
-                await tool.release(instance_id)
 
         tool_response_text = tool_execution_response.text
         if tool_response_text and len(tool_response_text) > self.max_tool_response_length:

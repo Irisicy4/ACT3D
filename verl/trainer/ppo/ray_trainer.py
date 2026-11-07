@@ -1588,6 +1588,16 @@ class RayPPOTrainer:
                     }
                 )
                 # collect metrics
+                # Per-component reward means (the dict returned by compute_score), so a score change
+                # can be attributed to accuracy / format / tool terms instead of the composite alone.
+                for _k in batch.meta_info.get("reward_extra_keys", []):
+                    _v = batch.non_tensor_batch.get(_k)
+                    if _v is None:
+                        continue
+                    try:
+                        metrics[f"reward_extra/{_k}/mean"] = float(np.mean(np.asarray(_v, dtype=np.float64)))
+                    except (TypeError, ValueError):
+                        pass  # non-numeric extras (e.g. error strings) are not scalar-loggable
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo

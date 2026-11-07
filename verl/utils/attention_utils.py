@@ -27,7 +27,33 @@ def _get_attention_functions() -> tuple[Callable, Callable, Callable, Callable]:
     if is_torch_npu_available(check_device=False):
         from verl.utils.npu_flash_attn_utils import index_first_axis, pad_input, rearrange, unpad_input
     else:
-        from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+        try:
+            from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+        except ImportError:
+            # flash_attn absent (e.g. cu13 env serving Qwen3.5 with sdpa): these four
+            # helpers are pure-torch tensor plumbing - use equivalent native versions.
+            import torch as _t
+            import torch.nn.functional as _F
+            from einops import rearrange
+
+            def index_first_axis(x, indices):
+                return x[indices]
+
+            def pad_input(hidden_states, indices, batch, seqlen):
+                out = _t.zeros(batch * seqlen, *hidden_states.shape[1:],
+                               device=hidden_states.device, dtype=hidden_states.dtype)
+                out[indices] = hidden_states
+                return out.reshape(batch, seqlen, *hidden_states.shape[1:])
+
+            def unpad_input(hidden_states, attention_mask, unused_mask=None):
+                all_masks = (attention_mask + unused_mask) if unused_mask is not None else attention_mask
+                seqlens_in_batch = all_masks.sum(dim=-1, dtype=_t.int32)
+                used_seqlens_in_batch = attention_mask.sum(dim=-1, dtype=_t.int32)
+                indices = _t.nonzero(all_masks.flatten(), as_tuple=False).flatten()
+                max_seqlen_in_batch = int(seqlens_in_batch.max().item()) if seqlens_in_batch.numel() else 0
+                cu_seqlens = _F.pad(_t.cumsum(seqlens_in_batch, dim=0, dtype=_t.int32), (1, 0))
+                flat = hidden_states.reshape(-1, *hidden_states.shape[2:])
+                return (flat[indices], indices, cu_seqlens, max_seqlen_in_batch, used_seqlens_in_batch)
 
     _index_first_axis, _pad_input, _rearrange, _unpad_input = index_first_axis, pad_input, rearrange, unpad_input
 

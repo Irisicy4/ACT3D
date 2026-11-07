@@ -20,6 +20,17 @@ from typing import Optional
 
 import torch
 from accelerate import init_empty_weights
+# transformers-5 compat: 4.x names below were removed in 5.x. The 5.x lazy module
+# self-swaps in sys.modules on every MISSED attribute lookup, so never probe missing names
+# (hasattr included) - gate on the version and set unconditionally via sys.modules.
+import sys as _sc
+import transformers as _tf_compat
+if int(_tf_compat.__version__.split(".")[0]) >= 5:
+    _v = _sc.modules["transformers"].AutoModelForImageTextToText     # settles lazy load
+    _m = _sc.modules["transformers"]
+    _m.AutoModelForVision2Seq = _v
+    _m.MistralForSequenceClassification = _m.AutoModelForSequenceClassification
+del _tf_compat, _sc
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -223,6 +234,18 @@ class BaseModelMerger(ABC):
             elif "ForCausalLM" in self.model_config.architectures[0]:
                 return AutoModelForCausalLM
             elif "ForConditionalGeneration" in self.model_config.architectures[0]:
+                # transformers >= 4.54 renamed AutoModelForVision2Seq -> AutoModelForImageTextToText
+                # (and stopped exporting the old name in 4.57), so import version-aware here instead
+                # of relying on a module-level AutoModelForVision2Seq that no longer exists.
+                import transformers
+                from packaging import version
+
+                if version.parse(transformers.__version__) >= version.parse("4.54.0"):
+                    from transformers import AutoModelForImageTextToText
+
+                    return AutoModelForImageTextToText
+                from transformers import AutoModelForVision2Seq
+
                 return AutoModelForVision2Seq
 
             raise NotImplementedError(f"Unknown architecture {self.model_config.architectures}")

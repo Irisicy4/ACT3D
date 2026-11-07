@@ -189,6 +189,33 @@ class MultiTurnSFTDataset(Dataset):
         # system prompt: <|im_start|>system\nYou are a helpful assistant.<|im_end|>\n
         # generation prompt: <|im_start|>assistant\n
         self.system_prompt, self.generation_prompt = extract_system_prompt_and_generation(self.tokenizer)
+        self.render_behind_dummy_user = {
+            role: self._lone_render_differs(role) for role in ("assistant", "tool")
+        }
+        for role, flag in self.render_behind_dummy_user.items():
+            if flag:
+                logger.warning(
+                    f"chat template renders a lone {role} message differently from one inside a conversation "
+                    "(e.g. Qwen3.5 drops <think>...</think> / the <|im_start|>user header); such turns will be "
+                    "rendered behind a dummy user turn whose tokens are then cut off."
+                )
+
+    def _lone_render_differs(self, role: str) -> bool:
+        """Templates that look at neighbouring turns (Qwen3.5: an assistant turn keeps its reasoning only
+        after the last user query; a tool turn opens `<|im_start|>user` only after a non-tool turn)
+        render a single message differently from the same message inside a conversation. Rendering turns
+        one by one then silently trains on text the model never sees at inference (no <think> at all)."""
+        probe = {"role": role, "content": "<think>probe reasoning</think>\nprobe answer"}
+        dummy = {"role": "user", "content": ""}
+        try:
+            alone = self.tokenizer.apply_chat_template([probe], tokenize=False, add_generation_prompt=False)
+            prefix = self.tokenizer.apply_chat_template([dummy], tokenize=False, add_generation_prompt=False)
+            behind = self.tokenizer.apply_chat_template([dummy, probe], tokenize=False, add_generation_prompt=False)
+        except Exception:
+            return False
+        if not behind.startswith(prefix):
+            return False
+        return behind[len(prefix) :] != alone
 
     def __len__(self):
         return len(self.messages)
@@ -220,8 +247,26 @@ class MultiTurnSFTDataset(Dataset):
         if enable_thinking is not None:
             apply_chat_template_kwargs["enable_thinking"] = enable_thinking
 
+        behind_dummy_user = self.render_behind_dummy_user.get(message["role"], False)
+        if behind_dummy_user:
+            # An empty user turn in front gives the template the neighbour it keys on (last query /
+            # previous role); its tokens (plus any default system prompt) are cut off below.
+            dummy_user = {"role": "user", "content": ""}
+            prefix_ids = processor.apply_chat_template(
+                [dummy_user],
+                tools=tools,
+                add_generation_prompt=False,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+                **apply_chat_template_kwargs,
+            )["input_ids"][0]
+            render_messages = [dummy_user, message]
+        else:
+            render_messages = [message]
+
         inputs = processor.apply_chat_template(
-            [message],
+            render_messages,
             tools=tools,
             add_generation_prompt=False,
             tokenize=True,
@@ -234,8 +279,12 @@ class MultiTurnSFTDataset(Dataset):
         input_ids = inputs.pop("input_ids")[0]
         attention_mask = inputs.pop("attention_mask")[0]
 
+        if behind_dummy_user:
+            assert torch.equal(input_ids[: len(prefix_ids)], prefix_ids), "dummy user prefix tokenized differently"
+            input_ids = input_ids[len(prefix_ids) :]
+            attention_mask = attention_mask[len(prefix_ids) :]
         # remove system prompt if exists
-        if index != 0 and message["role"] != "system":
+        elif index != 0 and message["role"] != "system":
             input_ids = input_ids[len(self.system_prompt) :]
             attention_mask = attention_mask[len(self.system_prompt) :]
 

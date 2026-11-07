@@ -458,6 +458,8 @@ class RateLimitedRewardManager(RewardManagerBase):
                 reward_extra_info["acc"] = 0.0
 
             except Exception as e:
+                if getattr(e, "fatal", False):  # e.g. the reward's judge is down: fail the step, do not score 0
+                    raise
                 logger.error(
                     f"Reward computation failed for data_source={data_source}: {e}. "
                     f"Response preview: {response_str[:100]}..."

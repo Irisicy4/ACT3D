@@ -263,6 +263,26 @@ class AgentLoopBase(ABC):
         Returns:
             list[int]: Prompt token ids.
         """
+        # A continuation (tool/user turns appended to an existing prompt) has to render exactly as it
+        # would inside the full conversation. Templates that key on the previous turn (Qwen3.5 opens
+        # `<|im_start|>user` before a tool turn only when the previous turn is not a tool turn) drop
+        # that header when the turns are rendered alone, so render them behind an empty user turn and
+        # cut its tokens off; the dummy turn also carries any default system prompt.
+        prefix_ids = None
+        if remove_system_prompt:
+            dummy_user = {"role": "user", "content": ""}
+            prefix_ids = await self.loop.run_in_executor(
+                None,
+                lambda: self.tokenizer.apply_chat_template(
+                    [dummy_user],
+                    add_generation_prompt=False,
+                    tokenize=True,
+                    return_dict=False,
+                    **self.apply_chat_template_kwargs,
+                ),
+            )
+            messages = [dummy_user] + list(messages)
+
         if self.processor is not None:
             raw_prompt = await self.loop.run_in_executor(
                 None,
@@ -284,7 +304,11 @@ class AgentLoopBase(ABC):
 
             model_inputs = self.processor(
                 text=[raw_prompt],
-                images=images,
+                # An EMPTY list must become None: when every tool call in a turn fails
+                # (text-only error responses), the tool loop passes images=[] and the
+                # transformers>=4.5x FAST image processor raises IndexError on it,
+                # killing the whole rollout batch. None means "no images" and is safe.
+                images=images if images else None,
                 videos=videos,
                 video_metadata=video_metadatas,
                 return_tensors="pt",
@@ -299,12 +323,15 @@ class AgentLoopBase(ABC):
                     tools=tools,
                     add_generation_prompt=True,
                     tokenize=True,
+                    return_dict=False,  # transformers 5 returns a BatchEncoding by default
                     **self.apply_chat_template_kwargs,
                 ),
             )
 
         if remove_system_prompt:
-            prompt_ids = prompt_ids[len(self.system_prompt) :]
+            if prompt_ids[: len(prefix_ids)] != list(prefix_ids):
+                logger.warning("dummy user turn did not tokenize as a clean prefix of the continuation render")
+            prompt_ids = prompt_ids[len(prefix_ids) :]
 
         return prompt_ids
 
@@ -672,12 +699,32 @@ class AgentLoopWorker:
         video_grid_thw = multi_modal_inputs.get("video_grid_thw")
 
         # Model's get_rope_index has been dynamically bind to the processor.
-        vision_position_ids, _ = self.processor.get_rope_index(
+        _rope_kwargs = dict(
             input_ids=input_ids,
             image_grid_thw=image_grid_thw,
             video_grid_thw=video_grid_thw,
             attention_mask=attention_mask,
         )
+        # transformers>=5 Qwen3VL requires mm_token_type_ids (0 text / 1 image / 2 video).
+        # Prefer the processor's own output; otherwise build it from the placeholder ids.
+        import inspect as _insp
+        if "mm_token_type_ids" in _insp.signature(self.processor.get_rope_index).parameters:
+            _mm = multi_modal_inputs.get("mm_token_type_ids")
+            # The processor's mm_token_type_ids only spans its own processed chunk
+            # (last tool image batch), not the full multi-turn sequence -> shape
+            # mismatch inside get_rope_index. Rebuild from placeholders instead.
+            if _mm is not None and _mm.shape[-1] != input_ids.shape[-1]:
+                _mm = None
+            if _mm is None:
+                _mm = torch.zeros_like(input_ids, dtype=torch.int32)
+                _img_id = getattr(self.processor, "image_token_id", None)
+                _vid_id = getattr(self.processor, "video_token_id", None)
+                if _img_id is not None:
+                    _mm[input_ids == _img_id] = 1
+                if _vid_id is not None:
+                    _mm[input_ids == _vid_id] = 2
+            _rope_kwargs["mm_token_type_ids"] = _mm
+        vision_position_ids, _ = self.processor.get_rope_index(**_rope_kwargs)
         vision_position_ids = vision_position_ids.transpose(0, 1)  # (3, 1, seq_len) => (1, 3, seq_len)
 
         valid_mask = attention_mask[0].bool()

@@ -26,6 +26,17 @@ import numpy as np
 import torch
 from tensordict.tensorclass import NonTensorData
 from torch import nn
+# transformers-5 compat: 4.x names below were removed in 5.x. The 5.x lazy module
+# self-swaps in sys.modules on every MISSED attribute lookup, so never probe missing names
+# (hasattr included) - gate on the version and set unconditionally via sys.modules.
+import sys as _sc
+import transformers as _tf_compat
+if int(_tf_compat.__version__.split(".")[0]) >= 5:
+    _v = _sc.modules["transformers"].AutoModelForImageTextToText     # settles lazy load
+    _m = _sc.modules["transformers"]
+    _m.AutoModelForVision2Seq = _v
+    _m.MistralForSequenceClassification = _m.AutoModelForSequenceClassification
+del _tf_compat, _sc
 from transformers import (
     AutoConfig,
     AutoModel,
@@ -724,6 +735,11 @@ def extract_multi_modal_inputs(
         if "image_bound" in inputs:
             has_image_bound = True
         for key, value in inputs.items():
+            if key == "mm_token_type_ids":
+                # transformers>=5 Qwen3-VL/Qwen3.5 processors emit this as (1, prompt_len); it is only consumed
+                # by get_rope_index when position_ids is None, and the actor always passes position_ids.
+                # Sequences differ in length, so concatenating it breaks any micro-batch > 1 (dynamic bsz).
+                continue
             if value is not None:
                 if key not in multi_modal_inputs_collected:
                     multi_modal_inputs_collected[key] = []
